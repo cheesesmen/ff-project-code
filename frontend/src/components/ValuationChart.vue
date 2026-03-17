@@ -1,77 +1,55 @@
-<template>
-  <div class="chart-container">
-    <div v-if="loading" class="loading">正在由 AI 评估实时数据...</div>
-    <div v-else ref="chartRef" style="width: 100%; height: 500px;"></div>
-  </div>
-</template>
+import numpy as np
+import pandas as pd
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from .apps import ApiConfig
+from .utils import extract_features_from_db # 确保 utils.py 已更新
+from .models import GenshinAccount, DeltaAccount
 
-<script setup>
-import { onMounted, ref, defineProps } from 'vue';
-import * as echarts from 'echarts';
-import axios from 'axios';
+class ValuationAnalyticsView(APIView):
+    def get(self, request):
+        game = request.query_params.get('game', 'genshin')
+        model = ApiConfig.ml_models.get(game)
+        
+        if not model:
+            return Response({"error": f"{game} 模型未加载，请先运行训练脚本"}, status=500)
 
-// frontend/src/components/ValuationChart.vue
-const fetchData = async () => {
-  try {
-    // 1. 确保加上了 http://127.0.0.1:8000
-    const res = await axios.get(`http://127.0.0.1:8000/api/valuation-analytics/?game=${props.game}`);
-    if (res.data && res.data.length > 0) {
-      renderChart(res.data); // 将数据传给绘图函数
-    }
-  } catch (err) {
-    console.error("数据请求失败，请检查后端是否开启", err);
-  }
-};
-const props = defineProps({
-  game: String // 接收父组件传来的游戏类型
-})
+        # 获取展示数据
+        if game == 'genshin':
+            accounts = GenshinAccount.objects.all().order_by('-id')[:60]
+        else:
+            accounts = DeltaAccount.objects.all().order_by('-id')[:60]
 
-const chartRef = ref(null);
-const loading = ref(true);
+        results = []
+        for acc in accounts:
+            try:
+                # 1. 提取特征（返回 pd.Series）
+                feat_series = extract_features_from_db(acc, game)
+                
+                # 2. 转换为 DataFrame 喂给 XGBoost (防止格式报错)
+                input_df = pd.DataFrame([feat_series])
+                
+                # 3. 推理预测（得到对数空间的溢价/价格）
+                pred_log = model.predict(input_df)[0]
+                pred_val = np.expm1(pred_log) # 还原对数
+                
+                # 4. 🌟 补偿逻辑（对齐 model_test 的残差架构）
+                if game == 'genshin':
+                    # 原神：最终估价 = AI预测溢价 + 抽数现金保底
+                    cash_guard = feat_series.get('pulls_cash_value', 0)
+                    final_predict = pred_val + cash_guard
+                else:
+                    # 三角洲：直接预测价格
+                    final_predict = pred_val
 
-onMounted(async () => {
-  try {
-    // 动态请求对应游戏的数据
-    const res = await axios.get(`http://127.0.0.1:8000/api/valuation-analytics/?game=${props.game}`);
-    const rawData = res.data;
-    loading.value = false;
-
-    if(rawData.error) {
-       console.error(rawData.error); return;
-    }
-
-    setTimeout(() => {
-      const myChart = echarts.init(chartRef.value);
-      const titleText = props.game === 'genshin' ? '原神实时捡漏雷达' : '三角洲行动资产估值图';
-      const colorNormal = props.game === 'genshin' ? '#91cc75' : '#fac858';
-
-      myChart.setOption({
-        title: { text: titleText, left: 'center' },
-        tooltip: { trigger: 'item', formatter: (p) => `${p.data[2]}<br/>实际标价: ￥${p.data[0]}<br/>AI评估价: ￥${p.data[1]}` },
-        xAxis: { name: '实际挂牌价(元)', splitLine: { show: false } },
-        yAxis: { name: 'AI预测价(元)' },
-        series: [{
-          type: 'scatter',
-          symbolSize: 12,
-          data: rawData.map(d => [d.actual, d.predict, d.name]),
-          itemStyle: {
-            // 如果 AI 估价大于实际标价 20%，标为红色高亮（代表极品捡漏号）
-            color: (p) => (p.data[1] > p.data[0] * 1.2 ? '#ee6666' : colorNormal) 
-          },
-          markLine: {
-            data: [{ type: 'average', name: '平均线' }],
-            lineStyle: { type: 'dashed', color: '#999' }
-          }
-        }]
-      });
-    }, 100);
-  } catch (err) {
-    console.error("加载图表失败", err);
-    loading.value = false;
-  }
-});
-</script>
-
-<style scoped>
-.loading { text-align: center; color: #999; line-height: 500px; font-size: 18px; }
-</style>
+                results.append({
+                    "name": acc.show_title[:20] + "...",
+                    "actual": float(acc.price),
+                    "predict": round(float(final_predict), 2),
+                    "ratio": round(float(final_predict / acc.price), 2) if acc.price > 0 else 0
+                })
+            except Exception as e:
+                print(f"预测单条数据失败: {e}")
+                continue
+        
+        return Response(results)
