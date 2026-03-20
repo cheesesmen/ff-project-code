@@ -1,0 +1,6 @@
+-- 原神表（兼容写法）
+ALTER TABLE api_genshinaccount 
+ADD COLUMN create_time DATETIME NULL COMMENT '创建时间';
+-- 三角洲表（去掉DEFAULT CURRENT_TIMESTAMP，避免版本兼容问题）
+ALTER TABLE api_deltaaccount 
+ADD COLUMN create_time DATETIME NULL COMMENT '创建时间';
