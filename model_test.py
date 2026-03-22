@@ -6,7 +6,8 @@ import joblib
 import warnings
 import xgboost as xgb
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
+import json
 
 warnings.filterwarnings("ignore")
 
@@ -34,19 +35,15 @@ def get_email_multiplier(text, game_type):
 
 # 🌟 智能分词计数器：专治三角洲的无数字文本
 def get_block_count(keyword, text):
-    # 尝试匹配 【关键词】内容1，内容2；
     m_block = re.search(fr'【{keyword}.*?】(.*?)(?:；|$)', text)
     if m_block:
         content = m_block.group(1).strip()
         if content:
-            # 用逗号或顿号分割计算数量
             return float(len([x for x in re.split(r'[,，、]', content) if x.strip()]))
         else:
-            # 兼容旧格式 【关键词10】
             m_num = re.search(fr'【{keyword}(\d+)】', text)
             if m_num: return float(m_num.group(1))
             
-    # 兜底匹配：关键词 59
     m_explicit = re.search(fr'{keyword}\s*[:：]?\s*(\d+)', text)
     if m_explicit:
         return float(m_explicit.group(1))
@@ -100,21 +97,16 @@ def extract_features(row, game_type):
         m_c5 = re.search(r'五星角色\s*[:：]?\s*(\d+)', text)
         f['c5_cnt'] = float(m_c5.group(1)) if m_c5 else 0.0
         
-        # 🌟 原神抽数核算
-        m_fates = re.search(r'纠缠(?:之源)?\s*[:：]?\s*(\d+)', text)
-        fates = float(m_fates.group(1)) if m_fates else 0.0
-        m_primos = re.search(r'原石\s*[:：]?\s*(\d+)', text)
-        primos = float(m_primos.group(1)) if m_primos else 0.0
+        fates = float(re.search(r'纠缠(?:之源)?\s*[:：]?\s*(\d+)', text).group(1)) if re.search(r'纠缠(?:之源)?\s*[:：]?\s*(\d+)', text) else 0.0
+        primos = float(re.search(r'原石\s*[:：]?\s*(\d+)', text).group(1)) if re.search(r'原石\s*[:：]?\s*(\d+)', text) else 0.0
         total_pulls = fates + (primos / 160.0)
         
-        # 你的阶梯折现规则 (为防止过度挤压角色空间，稍微下调为 0.7 和 1.8)
         f['pulls_cash_value'] = (total_pulls * 0.7) if total_pulls < 600 else (total_pulls * 1.8)
         
         f['meta_score'] = ((t1t2_c6_score * c6_synergy) + (t1t2_c2plus_score * c2_synergy) + t3_score + base_score + (f['w5_cnt'] * 30)) * f['email_coeff']
         f['c6_synergy_rate'], f['total_cons'], f['total_pulls'] = c6_synergy, float(total_cons), float(total_pulls)
         
     else:
-        # === 🌟 三角洲：智能分词计数 ===
         m_a = re.search(r'总资产\s*[:：]?\s*([\d\.]+)(?:[Mm姆]?)', text)
         f['assets_m'] = float(m_a.group(1)) if m_a else 0.0
         
@@ -126,7 +118,6 @@ def extract_features(row, game_type):
         elif re.search(r'高级安全箱|3x3|进阶安全箱', text): f['safe_box_level'] = 2.0
         elif '基础安全箱' in text: f['safe_box_level'] = 1.0
             
-        # 使用智能提取，哪怕没有数字只有名字，也能数出来！
         f['legend_wpn_cnt'] = get_block_count('传说武器', text)
         f['diancang_wpn_cnt'] = get_block_count('典藏武器', text)
         f['op_skin_cnt'] = get_block_count('干员皮肤', text)
@@ -166,10 +157,8 @@ def train_expert_model(search_pattern, game_type):
         
     y_raw = clean_df['price'].astype(float)
     
-    # 🌟 核心：原神开启“残差学习”
     if game_type == 'genshin':
         base_cash = X['pulls_cash_value']
-        # 实际价格减去抽数现金，得出“账号纯配置溢价”。如果买家折价卖，保底留 10 块钱溢价
         y_target = np.clip(y_raw - base_cash, 10, None)
         y_log = np.log1p(y_target)
     else:
@@ -189,11 +178,15 @@ def train_expert_model(search_pattern, game_type):
         n_jobs=-1
     )
     
-    model.fit(X_train, y_train_log, eval_set=[(X_test, y_test_log)], verbose=False)
+    # 修改点：同时传入训练集和测试集，以便记录双向 Loss 用于画学习曲线
+    model.fit(
+        X_train, y_train_log, 
+        eval_set=[(X_train, y_train_log), (X_test, y_test_log)], 
+        verbose=False
+    )
     
     y_pred_log = model.predict(X_test)
     
-    # 🌟 预测时，必须把扣除的独立现金加回来！
     if game_type == 'genshin':
         y_pred_raw = np.expm1(y_pred_log) + X_test['pulls_cash_value'].values
     else:
@@ -204,9 +197,15 @@ def train_expert_model(search_pattern, game_type):
     mae = mean_absolute_error(y_test_raw, y_pred_raw)
     r2 = r2_score(y_test_raw, y_pred_raw)
     
+    # 修改点：增加学术常用指标 RMSE 和 MAPE
+    rmse = np.sqrt(mean_squared_error(y_test_raw, y_pred_raw))
+    mape = np.mean(np.abs((y_test_raw - y_pred_raw) / y_test_raw)) * 100
+    
     print(f"\n🏆 {game_type.upper()} 训练报告:")
     print(f"   > R² 拟合优度: {r2:.4f}")
-    print(f"   > MAE 平均误差: ￥{mae:.2f}")
+    print(f"   > MAE 平均绝对误差: ￥{mae:.2f}")
+    print(f"   > RMSE 均方根误差: ￥{rmse:.2f}")
+    print(f"   > MAPE 平均绝对百分比误差: {mape:.2f}%")
     print(f"   > 训练/测试样本数: {len(X_train)} / {len(X_test)}")
 
     errors = abs(y_pred_series - y_test_raw)
@@ -218,22 +217,36 @@ def train_expert_model(search_pattern, game_type):
         pred = y_pred_series.loc[idx]
         feat = X.loc[idx].to_dict()
         raw_text = str(clean_df.loc[idx, 'showTitle']) + " " + str(clean_df.loc[idx, 'productName'])
+        print(f"   [{i}] 差距: ￥{errors.loc[idx]:.0f} (实际: ￥{actual:.0f} vs AI估: ￥{pred:.0f}) | 内容: {raw_text[:60]}...")
+
+    # ==========================================
+    # 🌟 修改点：论文可视化数据导出模块
+    # ==========================================
+    # 1. 导出特征重要性 (Feature Importance)
+    feature_importances = pd.DataFrame({
+        'Feature': X.columns,
+        'Importance': model.feature_importances_
+    }).sort_values(by='Importance', ascending=False)
+    feature_importances.to_csv(f'paper_data_{game_type}_feature_importance.csv', index=False)
+    
+    # 2. 导出测试集预测对比结果 (实际价格 vs 预测价格)
+    results_df = pd.DataFrame({
+        'Actual_Price': y_test_raw,
+        'Predicted_Price': y_pred_raw,
+        'Error': y_pred_raw - y_test_raw
+    })
+    results_df = pd.concat([results_df, X_test], axis=1) # 拼入特征方便论文做聚类分析
+    results_df.to_csv(f'paper_data_{game_type}_test_results.csv', index=False)
+    
+    # 3. 导出模型训练的 Loss 学习曲线 (Learning Curve)
+    evals_result = model.evals_result()
+    with open(f'paper_data_{game_type}_learning_curve.json', 'w') as f:
+        json.dump(evals_result, f)
         
-        print(f"\n   [{i}] 差距: ￥{errors.loc[idx]:.0f} (实际: ￥{actual:.0f} vs AI估: ￥{pred:.0f})")
-        
-        if game_type == 'genshin':
-            # 获取模型单纯对配置给出的溢价估值
-            ai_premium = np.expm1(y_pred_log[list(y_test_raw.index).index(idx)])
-            print(f"       [残差架构] 抽数保底现金: ￥{feat.get('pulls_cash_value',0):.0f} | AI评定账号配置溢价: ￥{ai_premium:.0f}")
-            print(f"       [战斗配置] 五星角色:{feat.get('c5_cnt',0):.0f}个 | 五星武器:{feat.get('w5_cnt',0):.0f}把 | 黄数:{feat.get('yellow_num',0):.0f}")
-        else:
-            print(f"       [智能扫描] 提取传说武器:{feat.get('legend_wpn_cnt',0):.0f}把 | 典藏武器:{feat.get('diancang_wpn_cnt',0):.0f}把")
-            print(f"       [智能扫描] 提取干员皮肤:{feat.get('op_skin_cnt',0):.0f}套 | 捆绑包:{feat.get('bundle_cnt',0):.0f}套 | 安全箱:{feat.get('safe_box_level',0):.0f}级")
-            
-        print(f"       内容: {raw_text[:180]}...")
+    print(f"\n📊 论文图表所需数据已导出: paper_data_{game_type}_*.csv/json")
 
     joblib.dump(model, f'valuer_{game_type}_pro.pkl')
-    print(f"\n✅ 模型已保存为: valuer_{game_type}_pro.pkl\n")
+    print(f"✅ 模型已保存为: valuer_{game_type}_pro.pkl\n")
 
 if __name__ == "__main__":
     train_expert_model('raw_Genshin_*.csv', 'genshin')
