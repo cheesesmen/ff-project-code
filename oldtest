@@ -1,0 +1,174 @@
+import pandas as pd
+import numpy as np
+import joblib
+import os
+import re
+import time
+from datetime import datetime
+from sqlalchemy import create_engine, text
+
+# ==================== 1. 数据库配置 ====================
+MYSQL_PASSWORD = "123456"
+DB_CONFIG = {
+    "host": "localhost",
+    "user": "root",
+    "password": MYSQL_PASSWORD,
+    "database": "game_db",
+    "charset": "utf8mb4"
+}
+
+# ==================== 2. AI 专家特征提取逻辑 ====================
+GENSHIN_TIER = {
+    1: ["兹白", "奈芙尔", "恰斯卡", "杜林", "玛薇卡", "芙宁娜", "丝柯克", "瓦雷莎", "菈乌玛", "伊涅芙", "茜特菈莉", "爱可菲", "菲林斯", "哥伦比娅"],
+    2: ["千织", "阿蕾奇诺", "玛拉妮", "法尔伽", "基尼奇", "那维莱特", "希诺宁", "闲云"],
+    3: ["艾梅莉埃", "林尼", "万叶", "雷电将军", "克洛琳德", "娜维娅"],
+    4: ["希格雯", "妮露", "艾尔海森", "神里绫华", "纳西妲", "申鹤", "阿贝多", "胡桃", "夜兰", "魈", "温迪", "优菈", "甘雨", "八重神子", "钟离", "白术", "珊瑚宫心海", "荒泷一斗", "流浪者"],
+    5: ["琴", "迪卢克", "可莉", "莫娜", "埃洛伊", "宵宫", "迪希雅", "神里绫人", "刻晴", "七七", "达达利亚", "提纳里", "赛诺", "梦见月瑞希"]
+}
+
+def get_email_multiplier(text, game_type):
+    if game_type == 'delta':
+        if re.search(r'不可二次实名|不可二次|不能二次|死实名', text): return 0.75
+        return 1.0 if re.search(r'可二次实名|可二次|包二次|支持二次', text) else 0.9
+    else:
+        if "未绑定" in text: return 1.0
+        return 0.85 if ("已实名" in text or "实名出售" in text) else 0.80
+
+def get_block_count(keyword, text):
+    m_block = re.search(fr'【{keyword}.*?】(.*?)(?:；|$)', text)
+    if m_block:
+        content = m_block.group(1).strip()
+        if content: return float(len([x for x in re.split(r'[,，、]', content) if x.strip()]))
+    m_num = re.search(fr'【{keyword}(\d+)】', text)
+    if m_num: return float(m_num.group(1))
+    m_explicit = re.search(fr'{keyword}\s*[:：]?\s*(\d+)', text)
+    return float(m_explicit.group(1)) if m_explicit else 0.0
+
+def extract_features_for_predict(row, game_type):
+    text_content = str(row.get('showTitle', '')) + " " + str(row.get('productName', ''))
+    f = {'email_coeff': get_email_multiplier(text_content, game_type)}
+
+    if game_type == 'genshin':
+        t1t2_c6_score, t1_c6_cnt, t2_c6_cnt = 0.0, 0, 0
+        t1t2_c2plus_score, t1_c2plus_cnt, t2_c2plus_cnt = 0.0, 0, 0
+        t3_score, base_score, total_cons = 0.0, 0.0, 0
+        m_y = re.search(r'黄数\s*[:：]?\s*(\d+)', text_content)
+        f['yellow_num'] = float(m_y.group(1)) if m_y else (float(re.search(r'(\d+)\s*黄(?!数)', text_content).group(1)) if re.search(r'(\d+)\s*黄(?!数)', text_content) else 0.0)
+        for tier, chars in GENSHIN_TIER.items():
+            for char in chars:
+                if char in text_content:
+                    m = re.search(fr'(满命|[0-6]命)[\s,，、]*{char}|{char}[\s,，、]*(满命|[0-6]命)', text_content)
+                    cons = 6 if m and '满' in (m.group(1) or m.group(2) or "") else (int((m.group(1) or m.group(2) or "0")[0]) if m and (m.group(1) or m.group(2) or "0")[0].isdigit() else 0)
+                    total_cons += cons
+                    if cons == 6:
+                        if tier == 1: t1t2_c6_score += 400; t1_c6_cnt += 1
+                        elif tier == 2: t1t2_c6_score += 200; t2_c6_cnt += 1
+                        elif tier == 3: t3_score += 80
+                    elif cons >= 2:
+                        if tier == 1: t1t2_c2plus_score += 80 + (cons * 30); t1_c2plus_cnt += 1
+                        elif tier == 2: t1t2_c2plus_score += 50 + (cons * 20); t2_c2plus_cnt += 1
+                    else: base_score += {1: 20, 2: 15, 3: 10, 4: 5, 5: 2}[tier]
+        c6_synergy = 1.0 + (t1_c6_cnt * 0.45) + (t2_c6_cnt * 0.25) - (0.45 if t1_c6_cnt > 0 else 0)
+        c2_synergy = 1.0 + (t1_c2plus_cnt * 0.25) + (t2_c2plus_cnt * 0.15) - (0.25 if t1_c2plus_cnt > 0 else 0)
+        f['w5_cnt'] = float(re.search(r'五星武器\s*[:：]?\s*(\d+)', text_content).group(1)) if re.search(r'五星武器\s*[:：]?\s*(\d+)', text_content) else 0.0
+        f['c5_cnt'] = float(re.search(r'五星角色\s*[:：]?\s*(\d+)', text_content).group(1)) if re.search(r'五星角色\s*[:：]?\s*(\d+)', text_content) else 0.0
+        fates = float(re.search(r'纠缠(?:之源)?\s*[:：]?\s*(\d+)', text_content).group(1)) if re.search(r'纠缠(?:之源)?\s*[:：]?\s*(\d+)', text_content) else 0.0
+        primos = float(re.search(r'原石\s*[:：]?\s*(\d+)', text_content).group(1)) if re.search(r'原石\s*[:：]?\s*(\d+)', text_content) else 0.0
+        total_pulls = fates + (primos / 160.0)
+        f['pulls_cash_value'] = (total_pulls * 0.7) if total_pulls < 600 else (total_pulls * 1.8)
+        f['meta_score'] = ((t1t2_c6_score * c6_synergy) + (t1t2_c2plus_score * c2_synergy) + t3_score + base_score + (f['w5_cnt'] * 30)) * f['email_coeff']
+        f['c6_synergy_rate'], f['total_cons'], f['total_pulls'] = c6_synergy, float(total_cons), float(total_pulls)
+        
+        # 额外提取等级字段
+        m_level = re.search(r'(\d+)级', text_content)
+        f['level'] = int(m_level.group(1)) if m_level else 0
+    else:
+        m_a = re.search(r'总资产\s*[:：]?\s*([\d\.]+)', text_content)
+        f['assets_m'] = float(m_a.group(1)) if m_a else 0.0
+        m_h = re.search(r'哈夫币\s*[:：]?\s*([\d\.]+)', text_content)
+        f['hafu_w'] = float(m_h.group(1)) if m_h else 0.0
+        f['safe_box_level'] = 3.0 if "顶级" in text_content else (2.0 if "高级" in text_content else 0.0)
+        f['legend_wpn_cnt'] = get_block_count('传说武器', text_content)
+        f['diancang_wpn_cnt'] = get_block_count('典藏武器', text_content)
+        f['op_skin_cnt'] = get_block_count('干员皮肤', text_content)
+        f['bundle_cnt'] = get_block_count('捆绑包', text_content)
+        f['delta_rough_baseline'] = (f['assets_m'] * 0.2 + f['legend_wpn_cnt'] * 120 + f['diancang_wpn_cnt'] * 200 + (f['op_skin_cnt'] + f['bundle_cnt']) * 150 + f['safe_box_level'] * 400) * f['email_coeff']
+    return f
+
+# ==================== 3. 核心导入与评估函数 ====================
+def import_and_evaluate(csv_path, game_type, table_name):
+    print(f"🚀 开始处理 {game_type.upper()} 历史数据...")
+    model_file = f'valuer_{game_type}_pro.pkl'
+    if not os.path.exists(model_file):
+        print(f"❌ 错误：找不到模型文件 {model_file}")
+        return
+    
+    model = joblib.load(model_file)
+    df = pd.read_csv(csv_path).drop_duplicates(subset=['productId'])
+    
+    engine = create_engine(f"mysql+pymysql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@{DB_CONFIG['host']}/{DB_CONFIG['database']}?charset=utf8mb4")
+    
+    records = []
+    for _, row in df.iterrows():
+        feat_dict = extract_features_for_predict(row, game_type)
+        
+        # 匹配数据库字段：去掉了 product_name 和 ai_price
+        if game_type == 'genshin':
+            records.append({
+                'product_id': str(row['productId']),
+                'price': float(row['price']),
+                'level': feat_dict.get('level', 0),
+                'assets_score': round(float(feat_dict.get('meta_score', 0.0)), 2),
+                'show_title': str(row['showTitle']),
+                'create_time': str(row.get('createTime', datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+            })
+        else: # delta
+            records.append({
+                'product_id': str(row['productId']),
+                'price': float(row['price']),
+                'assets_m': float(feat_dict.get('assets_m', 0.0)),
+                'hafu_w': float(feat_dict.get('hafu_w', 0.0)),
+                'show_title': str(row['showTitle']),
+                'create_time': str(row.get('createTime', datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+            })
+
+    with engine.connect() as conn:
+        conn.execute(text(f"DELETE FROM {table_name}"))
+        
+        # 根据不同游戏类型动态构建 SQL
+        if game_type == 'genshin':
+            insert_sql = text(f"""
+                INSERT INTO {table_name} (product_id, price, level, assets_score, show_title, create_time)
+                VALUES (:product_id, :price, :level, :assets_score, :show_title, :create_time)
+            """)
+        else:
+            insert_sql = text(f"""
+                INSERT INTO {table_name} (product_id, price, assets_m, hafu_w, show_title, create_time)
+                VALUES (:product_id, :price, :assets_m, :hafu_w, :show_title, :create_time)
+            """)
+
+        for rec in records:
+            conn.execute(insert_sql, rec)
+        conn.commit()
+    print(f"✅ {game_type.upper()} 数据导入完成，共计 {len(records)} 条。")
+
+def run_task():
+    DATA_CONFIG = {
+        "genshin": {
+            "csv": r"F:\ff project\code\raw_Genshin_10026_20260316_171310.csv",
+            "table": "api_genshinaccount"
+        },
+        "delta": {
+            "csv": r"F:\ff project\code\raw_DeltaForce_10371_20260319_155941.csv",
+            "table": "api_deltaaccount"
+        }
+    }
+
+    for game, info in DATA_CONFIG.items():
+        if os.path.exists(info['csv']):
+            import_and_evaluate(info['csv'], game, info['table'])
+        else:
+            print(f"⚠️ 跳过：未找到文件 {info['csv']}")
+
+if __name__ == "__main__":
+    run_task()

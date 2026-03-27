@@ -19,7 +19,7 @@ DB_CONFIG = {
     "charset": "utf8mb4"
 }
 
-def get_data_via_api(game_id, target_count=300):
+def get_data_via_api(game_id, target_count=100):
     url = "https://www.pxb7.com/api/search/product/selectSelledList"
     
     headers = {
@@ -146,7 +146,7 @@ def run_task():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
     for gid, game_info in games.items():
-        data = get_data_via_api(gid, target_count=300)
+        data = get_data_via_api(gid, target_count=100)
         if data:
             df = pd.DataFrame(data)
             df = df.drop_duplicates(subset=['productId'])
