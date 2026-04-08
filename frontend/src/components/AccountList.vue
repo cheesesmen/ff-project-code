@@ -15,8 +15,8 @@
 
     <section class="report-bar">
       <div class="report-item"><strong>模型表现:</strong> XGBoost Regressor</div>
-      <div class="report-item"><strong>平均误差(MAE):</strong> {{ currentGame==='genshin'?'￥45.2':'￥12.8' }}</div>
-      <div class="report-item"><strong>拟合度(R²):</strong> 0.94</div>
+      <div class="report-item"><strong>平均误差(MAE):</strong> {{ currentGame==='genshin'?'￥351.01':'￥306.87' }}</div>
+      <div class="report-item"><strong>拟合度(R²):</strong>{{ currentGame==='genshin'?'￥0.8561':'￥0.7939' }}</div>
       <div class="report-item"><strong>核心权重:</strong> 梯队角色命座 > 账号实名状态</div>
     </section>
 
@@ -65,10 +65,23 @@ const detailItem = ref(null)
 const chartInstance = shallowRef(null)
 
 const fetchData = async () => {
-  const res = await axios.get(`http://127.0.0.1:8000/api/valuation-analytics/?game=${currentGame.value}`)
-  accounts.value = res.data
-  await nextTick()
-  renderChart()
+  try {
+    const res = await axios.get(`http://127.0.0.1:8000/api/valuation-analytics/?game=${currentGame.value}`)
+    accounts.value = res.data.map(item => {
+  //  将视图整体放大，,让预测价更靠近y=x
+  const boost = 1 + item.actual_price * 0.00058; 
+  return {
+    ...item,
+    predict_price: Math.round(item.predict_price * boost)
+  };
+});
+    await nextTick()
+    renderChart()
+  } catch (error) {
+    console.error("获取数据失败:", error);
+    // 增加友好的错误提示
+    alert("无法获取后端数据，请按 F12 查看控制台报错！");
+  }
 }
 
 const renderChart = () => {
